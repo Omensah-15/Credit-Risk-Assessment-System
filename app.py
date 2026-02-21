@@ -1,15 +1,70 @@
+"""
+Credit Risk Assessment System
+--------------------------------
+Required packages:
+pip install joblib pandas numpy streamlit matplotlib
+"""
+
 import os
 import json
 import hashlib
 import sqlite3
 from datetime import datetime
 from typing import Dict, Any, Tuple, Optional, List
+import traceback
 
-import joblib
-import pandas as pd
-import numpy as np
-import streamlit as st
-import matplotlib.pyplot as plt
+# Handle imports with proper error messages
+try:
+    import joblib
+    JOBLIB_AVAILABLE = True
+except ImportError:
+    JOBLIB_AVAILABLE = False
+
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
+
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    NUMPY_AVAILABLE = False
+
+try:
+    import streamlit as st
+    STREAMLIT_AVAILABLE = True
+except ImportError:
+    STREAMLIT_AVAILABLE = False
+
+try:
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+
+# Check if all required packages are installed
+missing_packages = []
+if not JOBLIB_AVAILABLE:
+    missing_packages.append("joblib")
+if not PANDAS_AVAILABLE:
+    missing_packages.append("pandas")
+if not NUMPY_AVAILABLE:
+    missing_packages.append("numpy")
+if not STREAMLIT_AVAILABLE:
+    missing_packages.append("streamlit")
+if not MATPLOTLIB_AVAILABLE:
+    missing_packages.append("matplotlib")
+
+if missing_packages:
+    error_msg = f"Missing required packages: {', '.join(missing_packages)}. Please install them using: pip install {' '.join(missing_packages)}"
+    if STREAMLIT_AVAILABLE:
+        st.error(error_msg)
+        st.stop()
+    else:
+        print(error_msg)
+        exit(1)
 
 # MUST BE FIRST STREAMLIT COMMAND
 st.set_page_config(
@@ -31,23 +86,26 @@ CALIBRATED_MODEL_FILE = os.path.join(MODELS_DIR, "calibration_model.pkl")
 # -------------------- Database Initialization --------------------
 def init_db():
     """Initialize SQLite database for assessment results."""
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS assessment_results (
-            applicant_id TEXT PRIMARY KEY,
-            applicant_name TEXT,
-            applicant_email TEXT,
-            age INTEGER,
-            data_hash TEXT,
-            risk_score INTEGER,
-            probability_of_default REAL,
-            risk_category TEXT,
-            timestamp TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS assessment_results (
+                applicant_id TEXT PRIMARY KEY,
+                applicant_name TEXT,
+                applicant_email TEXT,
+                age INTEGER,
+                data_hash TEXT,
+                risk_score INTEGER,
+                probability_of_default REAL,
+                risk_category TEXT,
+                timestamp TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        st.error(f"Database initialization error: {str(e)}")
 
 init_db()
 
@@ -123,7 +181,16 @@ def preprocess_inference_data(input_data) -> pd.DataFrame:
 def load_models() -> Tuple[Optional[object], Optional[List[str]]]:
     """Load calibrated model and feature columns."""
     try:
+        if not os.path.exists(CALIBRATED_MODEL_FILE):
+            st.warning("Calibrated model file not found. Please run train.py first.")
+            return None, None
+            
         model = joblib.load(CALIBRATED_MODEL_FILE)
+        
+        if not os.path.exists(FEATURE_COLUMNS_FILE):
+            st.warning("Feature columns file not found. Please run train.py first.")
+            return None, None
+            
         feature_columns = joblib.load(FEATURE_COLUMNS_FILE)
         return model, feature_columns
     except Exception as e:
@@ -171,6 +238,14 @@ if 'assessment_results' not in st.session_state:
 # -------------------- Main UI --------------------
 st.title("Credit Risk Assessment System")
 st.markdown("---")
+
+# Check if model files exist
+model_files_exist = os.path.exists(CALIBRATED_MODEL_FILE) and os.path.exists(FEATURE_COLUMNS_FILE)
+if not model_files_exist:
+    st.warning(
+        "Model files not found. Please run train.py first to generate the required model files. "
+        "The application will continue in demo mode but predictions will not work."
+    )
 
 # Sidebar navigation
 menu = st.sidebar.selectbox(
@@ -256,15 +331,22 @@ if menu == "New Assessment":
                 # Generate data hash
                 data_hash = generate_data_hash(application)
                 
-                # Run prediction
-                try:
-                    proba, score, category, processed = predict_single(application)
-                except FileNotFoundError as e:
-                    st.error(str(e))
-                    st.stop()
-                except Exception as e:
-                    st.error(f"Prediction failed: {e}")
-                    st.stop()
+                # Run prediction if model exists
+                if model_files_exist:
+                    try:
+                        proba, score, category, processed = predict_single(application)
+                    except FileNotFoundError as e:
+                        st.error(str(e))
+                        st.stop()
+                    except Exception as e:
+                        st.error(f"Prediction failed: {e}")
+                        st.stop()
+                else:
+                    # Demo mode - generate sample data
+                    proba = 0.15
+                    score = 850
+                    category = "Low Risk"
+                    st.info("Running in demo mode with sample data. Train the model to get actual predictions.")
 
                 # Store in database
                 try:
@@ -287,6 +369,8 @@ if menu == "New Assessment":
                         application['submission_timestamp']
                     ))
                     conn.commit()
+                except Exception as e:
+                    st.error(f"Database error: {str(e)}")
                 finally:
                     conn.close()
 
@@ -394,11 +478,13 @@ if menu == "New Assessment":
 elif menu == "Assessment History":
     st.header("Assessment History")
     
-    conn = sqlite3.connect(DB_PATH)
     try:
+        conn = sqlite3.connect(DB_PATH)
         df = pd.read_sql_query("SELECT * FROM assessment_results ORDER BY timestamp DESC", conn)
-    finally:
         conn.close()
+    except Exception as e:
+        st.error(f"Error loading assessment history: {str(e)}")
+        df = pd.DataFrame()
 
     if df.empty:
         st.info("No assessment records found. Create a new assessment to get started.")
@@ -411,7 +497,7 @@ elif menu == "Assessment History":
             st.metric("Total Assessments", len(df))
         
         with col2:
-            avg_score = df['risk_score'].mean()
+            avg_score = df['risk_score'].mean() if not df['risk_score'].isna().all() else 0
             st.metric("Average Risk Score", f"{avg_score:.0f}")
         
         with col3:
