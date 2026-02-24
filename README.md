@@ -9,5 +9,5 @@
 ![image alt](https://github.com/Omensah-15/Credit-Risk-Assessment-System/blob/cf9fb2ba79e15486c52edf2d41e57ea2bfdcc65c/assests/architecture_overview.png)
 ![image alt](https://github.com/Omensah-15/Credit-Risk-Assessment-System/blob/cf9fb2ba79e15486c52edf2d41e57ea2bfdcc65c/assests/model_development.png)
 
-## LightGBM ML Model Results
+## ML Model Results
 ![image alt](https://github.com/Omensah-15/Credit-Risk-Assessment-System/blob/bb54eaf55c943c689226104105eefdfd30f9f326/assests/results.png)
