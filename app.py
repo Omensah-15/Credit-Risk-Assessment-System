@@ -13,8 +13,7 @@ import matplotlib.pyplot as plt
 
 # MUST BE FIRST STREAMLIT COMMAND
 st.set_page_config(
-    page_title="Credit Risk Assessment System",
-    page_icon="📊",
+    page_title="Credit Risk Assessment",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -25,10 +24,9 @@ MODELS_DIR = "models"
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-DB_PATH = os.path.join(DATA_DIR, "assessments.db")
-MODEL_PATH = os.path.join(MODELS_DIR, "credit_model.pkl")
-SCALER_PATH = os.path.join(MODELS_DIR, "scaler.pkl")
-FEATURES_PATH = os.path.join(MODELS_DIR, "features.pkl")
+DB_PATH = os.path.join(DATA_DIR, "assessment_results.db")
+FEATURE_COLUMNS_FILE = os.path.join(MODELS_DIR, "feature_columns.pkl")
+CALIBRATED_MODEL_FILE = os.path.join(MODELS_DIR, "calibration_model.pkl")
 
 # -------------------- Database Initialization --------------------
 def init_db():
@@ -36,20 +34,16 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS assessments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            applicant_id TEXT NOT NULL,
-            applicant_name TEXT NOT NULL,
-            applicant_email TEXT NOT NULL,
-            assessment_date TEXT NOT NULL,
-            risk_score INTEGER NOT NULL,
-            default_probability REAL NOT NULL,
-            risk_category TEXT NOT NULL,
-            data_hash TEXT NOT NULL,
-            annual_income REAL,
-            loan_amount REAL,
-            employment_status TEXT,
-            credit_score INTEGER
+        CREATE TABLE IF NOT EXISTS assessment_results (
+            applicant_id TEXT PRIMARY KEY,
+            applicant_name TEXT,
+            applicant_email TEXT,
+            age INTEGER,
+            data_hash TEXT,
+            risk_score INTEGER,
+            probability_of_default REAL,
+            risk_category TEXT,
+            timestamp TEXT
         )
     """)
     conn.commit()
@@ -57,12 +51,12 @@ def init_db():
 
 init_db()
 
-# -------------------- Utility Functions --------------------
+# -------------------- Utility: Deterministic Hashing --------------------
 def generate_data_hash(data: Dict[str, Any]) -> str:
-    """Generate deterministic SHA-256 hash of applicant data."""
+    """
+    Generate deterministic SHA-256 hash of applicant data.
+    """
     data_copy = dict(data)
-    # Remove timestamp fields that would change
-    data_copy.pop("assessment_date", None)
     data_copy.pop("submission_timestamp", None)
     canonical = json.dumps(data_copy, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -71,563 +65,347 @@ def verify_data_hash(data: Dict[str, Any], original_hash: str) -> bool:
     """Verify data integrity by comparing hashes."""
     return generate_data_hash(data) == original_hash
 
-# -------------------- Model Loading --------------------
-@st.cache_resource
-def load_model_artifacts():
-    """Load model, scaler, and feature names."""
-    try:
-        if not os.path.exists(MODEL_PATH):
-            st.error(f"Model file not found at {MODEL_PATH}. Please train the model first.")
-            return None, None, None, 0.5
-        
-        artifacts = joblib.load(MODEL_PATH)
-        
-        # Handle different model saving formats
-        if isinstance(artifacts, dict) and 'model' in artifacts:
-            # New format with artifacts dictionary
-            model = artifacts['model']
-            scaler = artifacts.get('scaler')
-            feature_names = artifacts.get('feature_names', [])
-            optimal_threshold = artifacts.get('optimal_threshold', 0.5)
-        else:
-            # Try loading individual components
-            model = joblib.load(MODEL_PATH)
-            scaler = joblib.load(SCALER_PATH) if os.path.exists(SCALER_PATH) else None
-            feature_names = joblib.load(FEATURES_PATH) if os.path.exists(FEATURES_PATH) else []
-            optimal_threshold = 0.5
-        
-        return model, scaler, feature_names, optimal_threshold
-    except Exception as e:
-        st.error(f"Error loading model: {str(e)}")
-        return None, None, None, 0.5
+# -------------------- Preprocessing --------------------
+EMPLOYMENT_MAPPING = {'employed': 0, 'self-employed': 1, 'unemployed': 2, 'student': 3}
+EDUCATION_MAPPING = {'High School': 0, 'Diploma': 1, 'Bachelor': 2, 'Master': 3, 'PhD': 4}
+LOAN_PURPOSE_MAPPING = {'Business': 0, 'Personal': 1, 'Car Loan': 2, 'Education': 3, 'Home Loan': 4}
 
-# -------------------- Data Preprocessing --------------------
-def preprocess_input_data(input_data: Dict[str, Any], feature_names: List[str], scaler=None) -> pd.DataFrame:
+def preprocess_inference_data(input_data) -> pd.DataFrame:
     """
     Preprocess input data for model inference.
     """
-    # Convert to DataFrame
     if isinstance(input_data, dict):
         df = pd.DataFrame([input_data])
     else:
         df = input_data.copy()
-    
-    # Create engineered features to match training
-    df['income_to_loan_ratio'] = df['annual_income'] / (df['loan_amount'] + 1)
-    df['payment_per_month'] = df['loan_amount'] / df['loan_term_months']
-    df['payment_to_income'] = df['payment_per_month'] / (df['annual_income'] / 12)
-    
-    # Risk indicators
-    df['default_rate'] = df['num_defaults'] / (df['num_previous_loans'] + 1)
-    df['credit_utilization'] = (df['num_previous_loans'] * df['loan_amount']) / (df['annual_income'] + 1)
-    df['payment_reliability'] = 1 / (df['avg_payment_delay_days'] + 1)
-    
-    # Interaction features
-    df['credit_history_x_score'] = df['credit_history_length'] * df['current_credit_score']
-    df['default_x_delay'] = df['num_defaults'] * df['avg_payment_delay_days']
-    df['age_x_income'] = df['age'] * df['annual_income'] / 100000
-    
-    # Polynomial features
-    for col in ['current_credit_score', 'annual_income', 'credit_history_length', 'age']:
-        if col in df.columns:
-            df[f'{col}_squared'] = df[col] ** 2
-            df[f'{col}_log'] = np.log1p(df[col])
-    
-    # Categorical encodings
-    employment_map = {'Employed': 0, 'Self-Employed': 1, 'Unemployed': 2, 'Retired': 3, 'Student': 4}
-    education_map = {'High School': 0, 'Diploma': 1, 'Bachelor': 2, 'Master': 3, 'PhD': 4}
-    purpose_map = {'Business': 0, 'Crypto-Backed': 1, 'Car Loan': 2, 'Education': 3, 'Home Loan': 4,
-                   'Debt Consolidation': 5, 'Major Purchase': 6, 'Medical': 7, 'Vacation': 8}
-    collateral_map = {'Yes': 1, 'No': 0}
-    
-    df['employment_status_encoded'] = df['employment_status'].map(employment_map).fillna(0)
-    df['education_level_encoded'] = df['education_level'].map(education_map).fillna(0)
-    df['loan_purpose_encoded'] = df['loan_purpose'].map(purpose_map).fillna(0)
-    df['collateral_present_encoded'] = df['collateral_present'].map(collateral_map).fillna(0)
-    
-    # Ensure all feature_names are present
-    for col in feature_names:
+
+    # Categorical mappings
+    df['employment_status'] = df.get('employment_status', pd.Series()).map(EMPLOYMENT_MAPPING).fillna(0).astype(int)
+    df['education_level'] = df.get('education_level', pd.Series()).map(EDUCATION_MAPPING).fillna(0).astype(int)
+    df['loan_purpose'] = df.get('loan_purpose', pd.Series()).map(LOAN_PURPOSE_MAPPING).fillna(0).astype(int)
+    df['collateral_present'] = df.get('collateral_present', pd.Series()).map({'Yes': 1, 'No': 0}).fillna(0).astype(int)
+
+    # Ensure required columns exist
+    required_cols = ['annual_income', 'loan_amount', 'num_previous_loans', 'credit_history_length', 'num_defaults']
+    for col in required_cols:
         if col not in df.columns:
             df[col] = 0
-    
-    # Select only the features the model expects
-    X = df[feature_names].copy()
-    
-    # Handle any missing values
-    X = X.fillna(0)
-    
-    # Scale if scaler is provided
-    if scaler is not None:
-        X_scaled = scaler.transform(X)
-        X = pd.DataFrame(X_scaled, columns=feature_names)
-    
-    return X
 
-# -------------------- Risk Assessment --------------------
-def assess_risk(input_data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Perform risk assessment on input data.
-    """
-    # Load model artifacts
-    model, scaler, feature_names, threshold = load_model_artifacts()
+    # Engineered features
+    df['income_to_loan_ratio'] = df['annual_income'] / (df['loan_amount'] + 1)
+    df['credit_utilization'] = df['num_previous_loans'] / (df['credit_history_length'] + 1)
+    df['default_rate'] = df['num_defaults'] / (df['num_previous_loans'] + 1)
+
+    # Ensure numeric columns are numeric and fill missing values
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    for c in numeric_cols:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+        median = df[c].median() if not df[c].isnull().all() else 0
+        df[c] = df[c].fillna(median)
+
+    # Load expected feature columns
+    if not os.path.exists(FEATURE_COLUMNS_FILE):
+        raise FileNotFoundError(
+            f"Feature columns file not found. Please run train.py first."
+        )
+
+    feature_columns: List[str] = joblib.load(FEATURE_COLUMNS_FILE)
     
-    if model is None:
-        raise RuntimeError("Model not loaded. Please train the model first.")
-    
-    if not feature_names:
-        raise RuntimeError("Feature names not found. Please check model artifacts.")
-    
-    # Preprocess data
-    X = preprocess_input_data(input_data, feature_names, scaler)
-    
-    # Make prediction
+    # Add missing columns with zero
+    for col in feature_columns:
+        if col not in df.columns:
+            df[col] = 0
+
+    return df[feature_columns]
+
+# -------------------- Model Loading --------------------
+@st.cache_resource
+def load_models() -> Tuple[Optional[object], Optional[List[str]]]:
+    """Load calibrated model and feature columns."""
     try:
-        probability = float(model.predict_proba(X)[0, 1])
+        model = joblib.load(CALIBRATED_MODEL_FILE)
+        feature_columns = joblib.load(FEATURE_COLUMNS_FILE)
+        return model, feature_columns
     except Exception as e:
-        # Try alternative prediction method
-        try:
-            probability = float(model.predict(X)[0])
-        except:
-            raise RuntimeError(f"Model prediction failed: {e}")
+        st.error(f"Error loading model: {str(e)}")
+        return None, None
+
+# -------------------- Prediction Functions --------------------
+def predict_single(input_dict: dict) -> Tuple[float, int, str, pd.DataFrame]:
+    """
+    Predict for a single applicant.
+    Returns: (probability, risk_score, category, processed_features)
+    """
+    model, feature_columns = load_models()
+    if model is None:
+        raise RuntimeError("Model not loaded. Please run train.py first.")
     
-    # Calculate risk score (0-1000, higher is safer)
-    risk_score = int(round((1 - probability) * 1000))
+    processed = preprocess_inference_data(input_dict)
+    
+    try:
+        proba = float(model.predict_proba(processed)[:, 1][0])
+    except Exception as e:
+        raise RuntimeError(f"Model prediction failed: {e}")
+    
+    # Calculate risk score (higher = safer)
+    risk_score = int(round((1 - proba) * 1000))
     
     # Determine risk category
-    if probability < 0.1:
+    if proba < 0.1:
         category = "Very Low Risk"
-    elif probability < 0.2:
+    elif proba < 0.2:
         category = "Low Risk"
-    elif probability < 0.4:
+    elif proba < 0.4:
         category = "Medium Risk"
-    elif probability < 0.6:
+    elif proba < 0.6:
         category = "High Risk"
     else:
         category = "Very High Risk"
     
-    return {
-        "default_probability": probability,
-        "risk_score": risk_score,
-        "risk_category": category,
-        "threshold_used": threshold
-    }
+    return proba, risk_score, category, processed
 
-# -------------------- Save Assessment --------------------
-def save_assessment(applicant_data: Dict[str, Any], assessment_result: Dict[str, Any], data_hash: str):
-    """Save assessment results to database."""
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    
-    cur.execute("""
-        INSERT INTO assessments
-        (applicant_id, applicant_name, applicant_email, assessment_date,
-         risk_score, default_probability, risk_category, data_hash,
-         annual_income, loan_amount, employment_status, credit_score)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        applicant_data.get('applicant_id', ''),
-        applicant_data.get('applicant_name', ''),
-        applicant_data.get('applicant_email', ''),
-        datetime.now().isoformat(),
-        assessment_result['risk_score'],
-        assessment_result['default_probability'],
-        assessment_result['risk_category'],
-        data_hash,
-        applicant_data.get('annual_income', 0),
-        applicant_data.get('loan_amount', 0),
-        applicant_data.get('employment_status', ''),
-        applicant_data.get('current_credit_score', 0)
-    ))
-    
-    conn.commit()
-    conn.close()
+# -------------------- Session State Initialization --------------------
+if 'assessment_results' not in st.session_state:
+    st.session_state.assessment_results = {}
 
-# -------------------- Load Assessment History --------------------
-@st.cache_data(ttl=60)
-def load_assessment_history():
-    """Load assessment history from database."""
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        df = pd.read_sql_query("""
-            SELECT 
-                applicant_id,
-                applicant_name,
-                applicant_email,
-                assessment_date,
-                risk_score,
-                default_probability,
-                risk_category,
-                annual_income,
-                loan_amount,
-                credit_score,
-                data_hash
-            FROM assessments 
-            ORDER BY assessment_date DESC
-        """, conn)
-    finally:
-        conn.close()
-    return df
+# -------------------- Main UI --------------------
+st.title("Credit Risk Assessment System")
+st.markdown("---")
 
-# -------------------- Delete Assessment --------------------
-def delete_assessment(applicant_id: str, assessment_date: str):
-    """Delete a specific assessment from database."""
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        DELETE FROM assessments 
-        WHERE applicant_id = ? AND assessment_date = ?
-    """, (applicant_id, assessment_date))
-    conn.commit()
-    conn.close()
-    st.cache_data.clear()
+# Sidebar navigation
+menu = st.sidebar.selectbox(
+    "Navigation",
+    ["New Assessment", "Assessment History"]
+)
 
-# -------------------- Clear All History --------------------
-def clear_all_history():
-    """Delete all assessments from database."""
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM assessments")
-    conn.commit()
-    conn.close()
-    st.cache_data.clear()
-
-# -------------------- Session State --------------------
-if 'assessment_completed' not in st.session_state:
-    st.session_state.assessment_completed = False
-    st.session_state.current_result = None
-    st.session_state.current_data = None
-    st.session_state.current_hash = None
-    st.session_state.page = "New Assessment"
-
-# -------------------- Sidebar --------------------
-with st.sidebar:
-    st.title("Navigation")
+# -------------------- New Assessment --------------------
+if menu == "New Assessment":
+    st.header("New Credit Risk Assessment")
     
-    # Simple radio buttons for navigation
-    selected_page = st.radio(
-        "Go to",
-        ["New Assessment", "Assessment History"],
-        index=0 if st.session_state.page == "New Assessment" else 1,
-        key="navigation"
-    )
-    
-    # Update session state when navigation changes
-    if selected_page != st.session_state.page:
-        st.session_state.page = selected_page
-        st.rerun()
-    
-    st.markdown("---")
-    
-    # Model status indicator
-    model, _, _, _ = load_model_artifacts()
-    if model is not None:
-        st.success("✓ Model loaded successfully")
-    else:
-        st.error("✗ Model not loaded")
-        st.caption("Please train the model first using train.py")
-
-# -------------------- New Assessment Page --------------------
-if st.session_state.page == "New Assessment":
-    st.title("New Credit Risk Assessment")
-    st.markdown("Enter applicant information to assess credit risk.")
-    
-    # Check if model is loaded
-    model, _, _, _ = load_model_artifacts()
-    if model is None:
-        st.warning("Model not loaded. Please train the model first using train.py")
-        st.stop()
-    
-    # Create form
     with st.form("assessment_form", clear_on_submit=False):
-        st.subheader("Personal Information")
         col1, col2 = st.columns(2)
         
         with col1:
-            applicant_id = st.text_input("Applicant ID *", placeholder="e.g., APP001")
-            applicant_name = st.text_input("Full Name *", placeholder="John Doe")
-            applicant_email = st.text_input("Email Address *", placeholder="john@example.com")
-            age = st.number_input("Age", min_value=18, max_value=100, value=35)
+            st.subheader("Personal Information")
+            applicant_id = st.text_input("Applicant ID *", help="Unique identifier for the applicant")
+            applicant_name = st.text_input("Full Name *")
+            applicant_email = st.text_input("Email Address *")
+            age = st.slider("Age", 18, 100, 30)
+            employment_status = st.selectbox("Employment Status", ["employed", "self-employed", "unemployed", "student"])
+            education_level = st.selectbox("Education Level", ["High School", "Diploma", "Bachelor", "Master", "PhD"])
         
         with col2:
-            employment_status = st.selectbox(
-                "Employment Status",
-                ["Employed", "Self-Employed", "Unemployed", "Retired", "Student"]
-            )
-            education_level = st.selectbox(
-                "Education Level",
-                ["High School", "Diploma", "Bachelor", "Master", "PhD"]
-            )
+            st.subheader("Financial Information (GHS)")
+            annual_income = st.number_input("Annual Income (GHS) *", min_value=0, value=50000, step=1000, format="%d")
+            loan_amount = st.number_input("Loan Amount (GHS) *", min_value=0, value=25000, step=1000, format="%d")
+            loan_purpose = st.selectbox("Loan Purpose", ["Business", "Personal", "Car Loan", "Education", "Home Loan"])
+            loan_term_months = st.slider("Loan Term (months)", 12, 84, 36)
+            collateral_present = st.radio("Collateral Present", ["Yes", "No"], horizontal=True)
         
         st.markdown("---")
-        st.subheader("Financial Information")
+        
         col3, col4 = st.columns(2)
         
         with col3:
-            annual_income = st.number_input(
-                "Annual Income (GHS) *",
-                min_value=0,
-                value=50000,
-                step=1000,
-                format="%d"
-            )
-            loan_amount = st.number_input(
-                "Loan Amount (GHS) *",
-                min_value=0,
-                value=25000,
-                step=1000,
-                format="%d"
-            )
-            loan_purpose = st.selectbox(
-                "Loan Purpose",
-                ["Business", "Crypto-Backed", "Car Loan", "Education", "Home Loan"]
-            )
+            st.subheader("Credit History")
+            credit_history_length = st.slider("Credit History (years)", 0, 30, 5)
+            num_previous_loans = st.slider("Number of Previous Loans", 0, 20, 2)
+            num_defaults = st.slider("Number of Defaults", 0, 10, 0)
+            current_credit_score = st.slider("Current Credit Score", 300, 850, 650)
         
         with col4:
-            loan_term_months = st.selectbox(
-                "Loan Term (months)",
-                [12, 24, 36, 48, 60, 72]
-            )
-            collateral_present = st.radio(
-                "Collateral Present",
-                ["Yes", "No"],
-                horizontal=True
-            )
-        
-        st.markdown("---")
-        st.subheader("Credit History")
-        col5, col6 = st.columns(2)
-        
-        with col5:
-            credit_history_length = st.number_input(
-                "Credit History (years)",
-                min_value=0,
-                max_value=50,
-                value=5
-            )
-            num_previous_loans = st.number_input(
-                "Number of Previous Loans",
-                min_value=0,
-                max_value=50,
-                value=2
-            )
-            num_defaults = st.number_input(
-                "Number of Defaults",
-                min_value=0,
-                max_value=20,
-                value=0
-            )
-        
-        with col6:
-            current_credit_score = st.slider(
-                "Current Credit Score",
-                min_value=300,
-                max_value=850,
-                value=650
-            )
-            avg_payment_delay_days = st.number_input(
-                "Average Payment Delay (days)",
-                min_value=0,
-                max_value=120,
-                value=5
-            )
-        
-        st.markdown("---")
-        
-        # Submit button
-        col_submit1, col_submit2, col_submit3 = st.columns([1, 2, 1])
-        with col_submit2:
-            submitted = st.form_submit_button(
-                "Run Risk Assessment",
-                type="primary",
-                use_container_width=True
-            )
-    
-    # Process form submission
+            st.subheader("Payment Behavior")
+            avg_payment_delay_days = st.slider("Average Payment Delay (days)", 0, 60, 5)
+
+        submitted = st.form_submit_button("Run Assessment", type="primary", use_container_width=True)
+
     if submitted:
         # Validate required fields
-        errors = []
+        missing_fields = []
         if not applicant_id:
-            errors.append("Applicant ID")
+            missing_fields.append("Applicant ID")
         if not applicant_name:
-            errors.append("Full Name")
+            missing_fields.append("Full Name")
         if not applicant_email:
-            errors.append("Email Address")
-        if annual_income <= 0:
-            errors.append("Annual Income must be greater than 0")
-        if loan_amount <= 0:
-            errors.append("Loan Amount must be greater than 0")
+            missing_fields.append("Email Address")
         
-        if errors:
-            st.error(f"Please fill in all required fields: {', '.join(errors)}")
+        if missing_fields:
+            st.error(f"Please provide: {', '.join(missing_fields)}")
         else:
             with st.spinner("Processing assessment..."):
-                # Prepare data
-                applicant_data = {
+                application = {
                     "applicant_id": applicant_id,
                     "applicant_name": applicant_name,
                     "applicant_email": applicant_email,
-                    "age": age,
+                    "age": int(age),
+                    "annual_income": float(annual_income),
                     "employment_status": employment_status,
                     "education_level": education_level,
-                    "annual_income": annual_income,
-                    "loan_amount": loan_amount,
+                    "credit_history_length": int(credit_history_length),
+                    "num_previous_loans": int(num_previous_loans),
+                    "num_defaults": int(num_defaults),
+                    "avg_payment_delay_days": int(avg_payment_delay_days),
+                    "current_credit_score": int(current_credit_score),
+                    "loan_amount": float(loan_amount),
+                    "loan_term_months": int(loan_term_months),
                     "loan_purpose": loan_purpose,
-                    "loan_term_months": loan_term_months,
                     "collateral_present": collateral_present,
-                    "credit_history_length": credit_history_length,
-                    "num_previous_loans": num_previous_loans,
-                    "num_defaults": num_defaults,
-                    "current_credit_score": current_credit_score,
-                    "avg_payment_delay_days": avg_payment_delay_days
+                    "submission_timestamp": datetime.utcnow().isoformat()
                 }
-                
-                # Generate data hash
-                data_hash = generate_data_hash(applicant_data)
-                
-                try:
-                    # Run assessment
-                    result = assess_risk(applicant_data)
-                    
-                    # Save to session state
-                    st.session_state.assessment_completed = True
-                    st.session_state.current_result = result
-                    st.session_state.current_data = applicant_data
-                    st.session_state.current_hash = data_hash
-                    
-                    # Save to database
-                    save_assessment(applicant_data, result, data_hash)
-                    
-                    # Force a rerun to show results
-                    st.rerun()
-                    
-                except Exception as e:
-                    st.error(f"Assessment failed: {str(e)}")
-    
-    # Display results if assessment completed
-    if st.session_state.assessment_completed and st.session_state.current_result:
-        result = st.session_state.current_result
-        data = st.session_state.current_data
-        data_hash = st.session_state.current_hash
-        
-        st.markdown("---")
-        st.header("Assessment Results")
-        
-        # Metrics row
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric(
-                "Risk Score",
-                f"{result['risk_score']}/1000"
-            )
-        
-        with col2:
-            st.metric(
-                "Default Probability",
-                f"{result['default_probability']:.1%}"
-            )
-        
-        with col3:
-            st.metric(
-                "Risk Category",
-                result['risk_category']
-            )
-        
-        with col4:
-            st.metric(
-                "Decision Threshold",
-                f"{result['threshold_used']:.2f}"
-            )
-        
-        # Risk gauge
-        st.subheader("Risk Assessment Visualization")
-        
-        # Create gauge chart
-        fig, ax = plt.subplots(figsize=(10, 2))
-        
-        # Create color gradient
-        colors = ['#28a745', '#5cb85c', '#f0ad4e', '#d9534f', '#c9302c']
-        
-        # Horizontal bar
-        risk_score = result['risk_score']
-        ax.barh([0], [risk_score], color=colors[min(4, risk_score//200)])
-        ax.barh([0], [1000 - risk_score], left=[risk_score], color='#e0e0e0')
-        
-        ax.set_xlim(0, 1000)
-        ax.set_ylim(-0.5, 0.5)
-        ax.set_yticks([])
-        ax.set_xlabel('Risk Score (Higher is Safer)')
-        
-        # Add markers
-        for i, label in enumerate(['Very Low', 'Low', 'Medium', 'High', 'Very High']):
-            pos = i * 200 + 100
-            ax.axvline(x=pos, color='black', linestyle='--', alpha=0.3, ymin=0.4, ymax=0.6)
-            ax.text(pos, -0.3, label, ha='center', va='center', fontsize=8)
-        
-        st.pyplot(fig)
-        plt.close()
-        
-        # Financial Summary
-        st.subheader("Financial Summary")
-        col_f1, col_f2, col_f3 = st.columns(3)
-        
-        with col_f1:
-            st.info(f"**Annual Income:** GHS {data['annual_income']:,.0f}")
-        
-        with col_f2:
-            st.info(f"**Loan Amount:** GHS {data['loan_amount']:,.0f}")
-        
-        with col_f3:
-            if data['annual_income'] > 0:
-                ltv = (data['loan_amount'] / data['annual_income']) * 100
-                st.info(f"**Loan-to-Income Ratio:** {ltv:.1f}%")
-        
-        # Data Integrity
-        with st.expander("Data Integrity Information"):
-            st.text("Data Hash:")
-            st.code(data_hash, language="text")
-            
-            if st.button("Verify Data Integrity", key="verify_btn"):
-                if verify_data_hash(data, data_hash):
-                    st.success("✓ Data integrity verified - Hash matches")
-                else:
-                    st.error("✗ Data integrity check failed - Hash mismatch")
-        
-        # Action buttons
-        col_b1, col_b2, col_b3 = st.columns([1, 1, 2])
-        
-        with col_b1:
-            if st.button("Start New Assessment", type="primary", use_container_width=True):
-                st.session_state.assessment_completed = False
-                st.session_state.current_result = None
-                st.session_state.current_data = None
-                st.session_state.current_hash = None
-                st.rerun()
-        
-        with col_b2:
-            if st.button("View History", use_container_width=True):
-                st.session_state.page = "Assessment History"
-                st.rerun()
 
-# -------------------- Assessment History Page --------------------
-elif st.session_state.page == "Assessment History":
-    st.title("Assessment History")
+                # Generate data hash
+                data_hash = generate_data_hash(application)
+                
+                # Run prediction
+                try:
+                    proba, score, category, processed = predict_single(application)
+                except FileNotFoundError as e:
+                    st.error(str(e))
+                    st.stop()
+                except Exception as e:
+                    st.error(f"Prediction failed: {e}")
+                    st.stop()
+
+                # Store in database
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    cur = conn.cursor()
+                    cur.execute("""
+                        INSERT OR REPLACE INTO assessment_results
+                        (applicant_id, applicant_name, applicant_email, age, data_hash, 
+                         risk_score, probability_of_default, risk_category, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        application['applicant_id'], 
+                        application['applicant_name'], 
+                        application['applicant_email'], 
+                        application['age'],
+                        data_hash, 
+                        score, 
+                        proba, 
+                        category,
+                        application['submission_timestamp']
+                    ))
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                # Store in session state
+                st.session_state.assessment_results[applicant_id] = {
+                    "data": application,
+                    "hash": data_hash,
+                    "probability_of_default": proba,
+                    "risk_score": score,
+                    "risk_category": category,
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+
+                # Display results in a clean format
+                st.markdown("### Assessment Results")
+                
+                # Results in a nice container
+                with st.container():
+                    col_result1, col_result2, col_result3 = st.columns(3)
+                    
+                    # Risk Score with color coding based on value
+                    score_color = "green" if score > 700 else "orange" if score > 400 else "red"
+                    col_result1.markdown(
+                        f"""
+                        <div style="padding: 20px; border-radius: 10px; background-color: #f0f2f6; text-align: center;">
+                            <p style="color: #666; margin-bottom: 5px;">Risk Score</p>
+                            <p style="font-size: 36px; font-weight: bold; color: {score_color};">{score}</p>
+                            <p style="color: #666;">/1000</p>
+                        </div>
+                        """, 
+                        unsafe_allow_html=True
+                    )
+                    
+                    # Default Probability
+                    proba_color = "green" if proba < 0.2 else "orange" if proba < 0.4 else "red"
+                    col_result2.markdown(
+                        f"""
+                        <div style="padding: 20px; border-radius: 10px; background-color: #f0f2f6; text-align: center;">
+                            <p style="color: #666; margin-bottom: 5px;">Default Probability</p>
+                            <p style="font-size: 36px; font-weight: bold; color: {proba_color};">{proba:.1%}</p>
+                        </div>
+                        """, 
+                        unsafe_allow_html=True
+                    )
+                    
+                    # Risk Category
+                    category_colors = {
+                        "Very Low Risk": "#28a745",
+                        "Low Risk": "#5cb85c",
+                        "Medium Risk": "#f0ad4e",
+                        "High Risk": "#d9534f",
+                        "Very High Risk": "#c9302c"
+                    }
+                    cat_color = category_colors.get(category, "#666")
+                    col_result3.markdown(
+                        f"""
+                        <div style="padding: 20px; border-radius: 10px; background-color: #f0f2f6; text-align: center;">
+                            <p style="color: #666; margin-bottom: 5px;">Risk Category</p>
+                            <p style="font-size: 28px; font-weight: bold; color: {cat_color};">{category}</p>
+                        </div>
+                        """, 
+                        unsafe_allow_html=True
+                    )
+
+                # Display financial summary with GHS
+                st.markdown("### Financial Summary")
+                col_fin1, col_fin2 = st.columns(2)
+                
+                with col_fin1:
+                    st.markdown(
+                        f"""
+                        <div style="padding: 15px; border-radius: 8px; background-color: #f0f2f6;">
+                            <p style="color: #666; margin-bottom: 5px;">Annual Income</p>
+                            <p style="font-size: 24px; font-weight: bold;">GHS {annual_income:,.0f}</p>
+                        </div>
+                        """, 
+                        unsafe_allow_html=True
+                    )
+                
+                with col_fin2:
+                    st.markdown(
+                        f"""
+                        <div style="padding: 15px; border-radius: 8px; background-color: #f0f2f6;">
+                            <p style="color: #666; margin-bottom: 5px;">Loan Amount</p>
+                            <p style="font-size: 24px; font-weight: bold;">GHS {loan_amount:,.0f}</p>
+                        </div>
+                        """, 
+                        unsafe_allow_html=True
+                    )
+
+                # Data hash display
+                st.markdown("### Data Integrity")
+                st.code(data_hash, language="text")
+                
+                # Verification button
+                col_verify, _ = st.columns([1, 3])
+                with col_verify:
+                    if st.button("Verify Data Integrity", use_container_width=True):
+                        if verify_data_hash(application, data_hash):
+                            st.success("Data integrity verified - Hash matches")
+                        else:
+                            st.error("Data integrity check failed - Hash mismatch")
+
+# -------------------- Assessment History --------------------
+elif menu == "Assessment History":
+    st.header("Assessment History")
     
-    # Load data
-    df = load_assessment_history()
-    
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql_query("SELECT * FROM assessment_results ORDER BY timestamp DESC", conn)
+    finally:
+        conn.close()
+
     if df.empty:
         st.info("No assessment records found. Create a new assessment to get started.")
-        
-        # Button to go to new assessment
-        if st.button("Create New Assessment", type="primary"):
-            st.session_state.page = "New Assessment"
-            st.rerun()
     else:
         # Summary statistics
         st.subheader("Summary Statistics")
-        
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3 = st.columns(3)
         
         with col1:
             st.metric("Total Assessments", len(df))
@@ -639,143 +417,65 @@ elif st.session_state.page == "Assessment History":
         with col3:
             high_risk_count = len(df[df['risk_category'].str.contains('High', na=False)])
             st.metric("High Risk Cases", high_risk_count)
-        
-        with col4:
-            avg_prob = df['default_probability'].mean()
-            st.metric("Avg Default Probability", f"{avg_prob:.1%}")
-        
-        # Distribution charts
-        st.subheader("Risk Distribution")
-        
-        col_chart1, col_chart2 = st.columns(2)
-        
-        with col_chart1:
-            fig1, ax1 = plt.subplots(figsize=(8, 4))
-            ax1.hist(df['risk_score'], bins=20, color='steelblue', edgecolor='white', alpha=0.7)
-            ax1.set_xlabel('Risk Score')
-            ax1.set_ylabel('Count')
-            ax1.set_title('Risk Score Distribution')
-            ax1.axvline(x=df['risk_score'].mean(), color='red', linestyle='--', 
-                       label=f'Mean: {df["risk_score"].mean():.0f}')
-            ax1.legend()
-            st.pyplot(fig1)
-            plt.close()
-        
-        with col_chart2:
-            fig2, ax2 = plt.subplots(figsize=(8, 4))
-            category_counts = df['risk_category'].value_counts()
-            colors = ['#28a745', '#5cb85c', '#f0ad4e', '#d9534f', '#c9302c']
-            ax2.pie(category_counts.values, labels=category_counts.index, autopct='%1.1f%%',
-                    colors=colors[:len(category_counts)], startangle=90)
-            ax2.set_title('Risk Category Distribution')
-            st.pyplot(fig2)
-            plt.close()
-        
+
         # Assessment records table
         st.subheader("Assessment Records")
         
-        # Format for display
+        # Prepare display dataframe
         display_df = df.copy()
-        display_df['default_probability'] = display_df['default_probability'].apply(
-            lambda x: f"{x:.1%}"
+        display_df['probability_of_default'] = display_df['probability_of_default'].apply(
+            lambda x: f"{float(x):.1%}" if pd.notnull(x) else "N/A"
         )
-        display_df['assessment_date'] = pd.to_datetime(display_df['assessment_date']).dt.strftime('%Y-%m-%d %H:%M')
-        display_df['loan_amount'] = display_df['loan_amount'].apply(
-            lambda x: f"GHS {x:,.0f}" if pd.notnull(x) else "N/A"
-        )
-        
-        # Add selection column
-        display_df['Select'] = False
-        
-        # Create data editor for selection
-        edited_df = st.data_editor(
-            display_df[['Select', 'applicant_id', 'applicant_name', 'risk_score', 
-                       'risk_category', 'default_probability', 'assessment_date', 'loan_amount']],
+        display_df['data_hash_short'] = display_df['data_hash'].apply(lambda x: f"{x[:16]}..." if x else "N/A")
+        display_df['timestamp'] = pd.to_datetime(display_df['timestamp']).dt.strftime('%Y-%m-%d %H:%M')
+
+        # Display as a clean table
+        st.dataframe(
+            display_df[[
+                'applicant_id', 'applicant_name', 'risk_score', 'risk_category',
+                'probability_of_default', 'timestamp'
+            ]],
             use_container_width=True,
             column_config={
-                "Select": st.column_config.CheckboxColumn("Select", default=False),
-                "applicant_id": "ID",
+                "applicant_id": "Applicant ID",
                 "applicant_name": "Name",
                 "risk_score": "Risk Score",
-                "risk_category": "Category",
-                "default_probability": "Default Prob",
-                "assessment_date": "Date",
-                "loan_amount": "Loan Amount"
-            },
-            hide_index=True,
-            key="history_editor"
+                "risk_category": "Risk Category",
+                "probability_of_default": "Default Prob.",
+                "timestamp": "Assessment Date"
+            }
         )
-        
-        # Get selected rows
-        selected_rows = edited_df[edited_df['Select']].index.tolist()
-        
-        # Action buttons
-        col_act1, col_act2, col_act3, col_act4 = st.columns([1, 1, 1, 2])
-        
-        with col_act1:
-            if st.button("Export CSV", use_container_width=True):
-                csv = df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="Download CSV",
-                    data=csv,
-                    file_name=f"assessments_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    key="download_btn"
-                )
-        
-        with col_act2:
-            if selected_rows and st.button("Delete Selected", use_container_width=True, type="secondary"):
-                for idx in selected_rows:
-                    row = df.iloc[idx]
-                    delete_assessment(row['applicant_id'], row['assessment_date'])
-                st.success(f"Deleted {len(selected_rows)} record(s)")
-                st.rerun()
-        
-        with col_act3:
-            if st.button("Clear All History", use_container_width=True, type="secondary"):
-                confirm = st.checkbox("Confirm delete all records?")
-                if confirm:
-                    clear_all_history()
-                    st.success("All records deleted")
-                    st.rerun()
-        
-        with col_act4:
-            if st.button("Refresh Data", use_container_width=True):
-                st.cache_data.clear()
-                st.rerun()
-        
-        # Detailed view for selected record
-        if selected_rows and len(selected_rows) == 1:
-            idx = selected_rows[0]
-            record = df.iloc[idx]
-            
-            st.markdown("---")
-            st.subheader(f"Details for {record['applicant_name']}")
-            
-            col_det1, col_det2 = st.columns(2)
-            
-            with col_det1:
-                st.text(f"Applicant ID: {record['applicant_id']}")
-                st.text(f"Email: {record['applicant_email']}")
-                st.text(f"Assessment Date: {record['assessment_date']}")
-                st.text(f"Credit Score: {record['credit_score']}")
-            
-            with col_det2:
-                st.text(f"Risk Score: {record['risk_score']}/1000")
-                st.text(f"Default Probability: {record['default_probability']:.1%}")
-                st.text(f"Risk Category: {record['risk_category']}")
-                st.text(f"Loan Amount: GHS {record['loan_amount']:,.0f}")
-            
-            # Data hash
-            with st.expander("Data Integrity Hash"):
-                st.code(record['data_hash'], language="text")
-        
-        # New assessment button
-        st.markdown("---")
-        if st.button("+ Create New Assessment", type="primary", use_container_width=True):
-            st.session_state.page = "New Assessment"
-            st.rerun()
 
-# -------------------- Footer --------------------
-st.markdown("---")
-## st.caption("Credit Risk Assessment System v2.0 | Professional Version")
+        # Export and verify section
+        col_export, col_verify = st.columns(2)
+        
+        with col_export:
+            csv = display_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download CSV Export",
+                csv,
+                "assessment_history.csv",
+                "text/csv",
+                use_container_width=True
+            )
+        
+        with col_verify:
+            # Record verification
+            if not df.empty:
+                selected_id = st.selectbox(
+                    "Select applicant to verify",
+                    df['applicant_id'].tolist(),
+                    key="verify_select"
+                )
+                
+                if selected_id and st.button("Verify Record Integrity", use_container_width=True):
+                    record = df[df['applicant_id'] == selected_id].iloc[0]
+                    
+                    st.markdown("**Stored Data Hash:**")
+                    st.code(record['data_hash'], language="text")
+                    
+                    # Simplified verification note
+                    st.info(
+                        "To fully verify data integrity, you would need to reconstruct "
+                        "the original application data and compare its hash with the stored hash."
+                    )
