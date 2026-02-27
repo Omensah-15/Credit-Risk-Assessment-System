@@ -2,7 +2,7 @@ import os
 import json
 import hashlib
 import sqlite3
-import pickle  # Use pickle instead of joblib
+import pickle
 from datetime import datetime
 from typing import Dict, Any, Tuple, Optional, List
 
@@ -33,6 +33,8 @@ DB_PATH = os.path.join(DATA_DIR, "assessment_results.db")
 # Model files
 MODEL_FILE = os.path.join(MODELS_DIR, "model.pkl")
 FEATURES_FILE = os.path.join(MODELS_DIR, "features.pkl")
+SCALER_FILE = os.path.join(MODELS_DIR, "scaler.pkl")
+CREDIT_MODEL_FILE = os.path.join(MODELS_DIR, "credit_model.pkl")
 
 # -------------------- Database Initialization --------------------
 def init_db():
@@ -71,29 +73,100 @@ def verify_data_hash(data: Dict[str, Any], original_hash: str) -> bool:
     """Verify data integrity by comparing hashes."""
     return generate_data_hash(data) == original_hash
 
+# -------------------- Check if file is valid pickle --------------------
+def is_valid_pickle(file_path):
+    """Check if file exists and is a valid pickle file."""
+    if not os.path.exists(file_path):
+        return False
+    
+    # Check file size (if too small, might be LFS pointer)
+    file_size = os.path.getsize(file_path)
+    if file_size < 1024:  # Less than 1KB - likely an LFS pointer
+        return False
+    
+    # Try to read the first few bytes to check if it's a pickle
+    try:
+        with open(file_path, 'rb') as f:
+            header = f.read(10)
+            # Pickle files start with certain bytes
+            return True
+    except:
+        return False
+
 # -------------------- Simple Model Loading with PICKLE --------------------
 @st.cache_resource
 def load_model():
-    """Load model using pickle - NO XGBOOST IMPORT NEEDED"""
+    """Load model using pickle."""
     try:
-        # Just load the model file directly with pickle
-        if os.path.exists(MODEL_FILE):
-            with open(MODEL_FILE, 'rb') as f:
-                model = pickle.load(f)
-            
-            # Load features if they exist
-            feature_names = []
-            if os.path.exists(FEATURES_FILE):
-                with open(FEATURES_FILE, 'rb') as f:
-                    feature_names = pickle.load(f)
-            
-            return model, feature_names
+        # First check if files exist and are valid
+        st.sidebar.write("Checking model files...")
+        
+        files_found = []
+        for f in [MODEL_FILE, FEATURES_FILE, SCALER_FILE, CREDIT_MODEL_FILE]:
+            if os.path.exists(f):
+                size = os.path.getsize(f)
+                files_found.append(f"{os.path.basename(f)} ({size} bytes)")
+        
+        if files_found:
+            st.sidebar.write("Files found:")
+            for f in files_found:
+                st.sidebar.write(f"  • {f}")
         else:
-            st.error(f"Model file not found: {MODEL_FILE}")
-            return None, None
+            st.sidebar.error("No model files found in models directory")
+            return None, None, None
+        
+        # Try credit_model.pkl first (might contain everything)
+        if os.path.exists(CREDIT_MODEL_FILE) and os.path.getsize(CREDIT_MODEL_FILE) > 1024:
+            try:
+                with open(CREDIT_MODEL_FILE, 'rb') as f:
+                    artifacts = pickle.load(f)
+                
+                if isinstance(artifacts, dict):
+                    model = artifacts.get('model')
+                    scaler = artifacts.get('scaler')
+                    feature_names = artifacts.get('feature_names', [])
+                    if model is not None:
+                        st.sidebar.success("✓ Loaded from credit_model.pkl")
+                        return model, scaler, feature_names
+            except Exception as e:
+                st.sidebar.write(f"Credit model load failed: {str(e)[:50]}")
+        
+        # Try model.pkl
+        if os.path.exists(MODEL_FILE) and os.path.getsize(MODEL_FILE) > 1024:
+            try:
+                with open(MODEL_FILE, 'rb') as f:
+                    model = pickle.load(f)
+                
+                # Try to load features
+                feature_names = []
+                if os.path.exists(FEATURES_FILE) and os.path.getsize(FEATURES_FILE) > 1024:
+                    try:
+                        with open(FEATURES_FILE, 'rb') as f:
+                            feature_names = pickle.load(f)
+                    except:
+                        pass
+                
+                # Try to load scaler
+                scaler = None
+                if os.path.exists(SCALER_FILE) and os.path.getsize(SCALER_FILE) > 1024:
+                    try:
+                        with open(SCALER_FILE, 'rb') as f:
+                            scaler = pickle.load(f)
+                    except:
+                        pass
+                
+                st.sidebar.success("✓ Loaded from model.pkl")
+                return model, scaler, feature_names
+                
+            except Exception as e:
+                st.sidebar.write(f"Model load failed: {str(e)[:50]}")
+        
+        st.sidebar.error("Could not load any valid model file")
+        return None, None, None
+        
     except Exception as e:
-        st.error(f"Error loading model: {str(e)}")
-        return None, None
+        st.sidebar.error(f"Error: {str(e)[:100]}")
+        return None, None, None
 
 # -------------------- Preprocessing --------------------
 EMPLOYMENT_MAPPING = {
@@ -143,12 +216,10 @@ def preprocess_inference_data(input_data):
     return feature_df
 
 # -------------------- Prediction Function --------------------
-def predict_single(input_dict: dict) -> Tuple[float, int, str]:
+def predict_single(input_dict: dict, model, scaler, feature_names) -> Tuple[float, int, str]:
     """
     Predict for a single applicant.
     """
-    model, feature_names = load_model()
-    
     if model is None:
         raise RuntimeError("Model not loaded")
     
@@ -191,18 +262,8 @@ if 'assessment_results' not in st.session_state:
 st.title("Credit Risk Assessment System")
 st.markdown("---")
 
-# Check model status
-model, feature_names = load_model()
-if model is not None:
-    st.sidebar.success("✓ Model Loaded Successfully")
-else:
-    st.sidebar.error("✗ Model Not Loaded")
-    # Show available files
-    if os.path.exists(MODELS_DIR):
-        files = os.listdir(MODELS_DIR)
-        st.sidebar.write("Files in models directory:")
-        for f in files:
-            st.sidebar.write(f"  • {f}")
+# Load model
+model, scaler, feature_names = load_model()
 
 # Sidebar navigation
 menu = st.sidebar.selectbox(
@@ -215,7 +276,27 @@ if menu == "New Assessment":
     st.header("New Credit Risk Assessment")
     
     if model is None:
-        st.error("Model not loaded. Please check the models directory.")
+        st.error("⚠️ Model not loaded. Please check the models directory.")
+        
+        # Show files in models directory
+        if os.path.exists(MODELS_DIR):
+            files = os.listdir(MODELS_DIR)
+            if files:
+                st.write("Files in models directory:")
+                for f in files:
+                    file_path = os.path.join(MODELS_DIR, f)
+                    size = os.path.getsize(file_path)
+                    st.write(f"  • {f} ({size} bytes)")
+                    
+                    # If file is too small, it might be an LFS pointer
+                    if size < 1024:
+                        st.write(f"    ⚠️ File is only {size} bytes - may be a Git LFS pointer")
+                        st.write(f"    To fix: Download the actual file from GitHub or retrain the model")
+            else:
+                st.write("No files found in models directory")
+        else:
+            st.write("Models directory not found")
+        
         st.stop()
     
     with st.form("assessment_form", clear_on_submit=False):
@@ -323,7 +404,7 @@ if menu == "New Assessment":
                 
                 # Run prediction
                 try:
-                    proba, score, category = predict_single(application)
+                    proba, score, category = predict_single(application, model, scaler, feature_names)
                 except Exception as e:
                     st.error(f"Prediction failed: {e}")
                     st.stop()
