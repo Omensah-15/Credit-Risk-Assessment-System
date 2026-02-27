@@ -26,9 +26,12 @@ os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(DATA_DIR, "assessments.db")
-MODEL_PATH = os.path.join(MODELS_DIR, "credit_model.pkl")
-SCALER_PATH = os.path.join(MODELS_DIR, "scaler.pkl")
-FEATURES_PATH = os.path.join(MODELS_DIR, "features.pkl")
+
+# Your specific model files
+MODEL_PATH = os.path.join(MODELS_DIR, "model.pkl")  # The calibrated stacking model
+SCALER_PATH = os.path.join(MODELS_DIR, "scaler.pkl")  # The robust scaler
+FEATURES_PATH = os.path.join(MODELS_DIR, "features.pkl")  # The feature names
+CREDIT_MODEL_PATH = os.path.join(MODELS_DIR, "credit_model.pkl")  # Full artifacts
 
 # -------------------- Database Initialization --------------------
 def init_db():
@@ -49,7 +52,12 @@ def init_db():
             annual_income REAL,
             loan_amount REAL,
             employment_status TEXT,
-            credit_score INTEGER
+            credit_score INTEGER,
+            age INTEGER,
+            loan_term INTEGER,
+            num_previous_loans INTEGER,
+            num_defaults INTEGER,
+            payment_delay INTEGER
         )
     """)
     conn.commit()
@@ -74,29 +82,45 @@ def verify_data_hash(data: Dict[str, Any], original_hash: str) -> bool:
 # -------------------- Model Loading --------------------
 @st.cache_resource
 def load_model_artifacts():
-    """Load model, scaler, and feature names."""
+    """Load model, scaler, and feature names from your specific files."""
     try:
-        if not os.path.exists(MODEL_PATH):
-            st.error(f"Model file not found at {MODEL_PATH}. Please train the model first.")
+        # Try loading the full artifacts first (credit_model.pkl)
+        if os.path.exists(CREDIT_MODEL_PATH):
+            artifacts = joblib.load(CREDIT_MODEL_PATH)
+            if isinstance(artifacts, dict):
+                model = artifacts.get('model')
+                scaler = artifacts.get('scaler')
+                feature_names = artifacts.get('feature_names', [])
+                optimal_threshold = artifacts.get('optimal_threshold', 0.5)
+                
+                if model is not None:
+                    print(f"Loaded model from {CREDIT_MODEL_PATH}")
+                    return model, scaler, feature_names, optimal_threshold
+        
+        # Fall back to individual files
+        model = None
+        scaler = None
+        feature_names = []
+        optimal_threshold = 0.5
+        
+        if os.path.exists(MODEL_PATH):
+            model = joblib.load(MODEL_PATH)
+            print(f"Loaded model from {MODEL_PATH}")
+        
+        if os.path.exists(SCALER_PATH):
+            scaler = joblib.load(SCALER_PATH)
+            print(f"Loaded scaler from {SCALER_PATH}")
+        
+        if os.path.exists(FEATURES_PATH):
+            feature_names = joblib.load(FEATURES_PATH)
+            print(f"Loaded {len(feature_names)} features from {FEATURES_PATH}")
+        
+        if model is None:
+            st.error("No model file found. Please train the model first.")
             return None, None, None, 0.5
         
-        artifacts = joblib.load(MODEL_PATH)
-        
-        # Handle different model saving formats
-        if isinstance(artifacts, dict) and 'model' in artifacts:
-            # New format with artifacts dictionary
-            model = artifacts['model']
-            scaler = artifacts.get('scaler')
-            feature_names = artifacts.get('feature_names', [])
-            optimal_threshold = artifacts.get('optimal_threshold', 0.5)
-        else:
-            # Try loading individual components
-            model = joblib.load(MODEL_PATH)
-            scaler = joblib.load(SCALER_PATH) if os.path.exists(SCALER_PATH) else None
-            feature_names = joblib.load(FEATURES_PATH) if os.path.exists(FEATURES_PATH) else []
-            optimal_threshold = 0.5
-        
         return model, scaler, feature_names, optimal_threshold
+        
     except Exception as e:
         st.error(f"Error loading model: {str(e)}")
         return None, None, None, 0.5
@@ -105,6 +129,7 @@ def load_model_artifacts():
 def preprocess_input_data(input_data: Dict[str, Any], feature_names: List[str], scaler=None) -> pd.DataFrame:
     """
     Preprocess input data for model inference.
+    Must match the preprocessing from your training notebook.
     """
     # Convert to DataFrame
     if isinstance(input_data, dict):
@@ -115,7 +140,7 @@ def preprocess_input_data(input_data: Dict[str, Any], feature_names: List[str], 
     # Create engineered features to match training
     df['income_to_loan_ratio'] = df['annual_income'] / (df['loan_amount'] + 1)
     df['payment_per_month'] = df['loan_amount'] / df['loan_term_months']
-    df['payment_to_income'] = df['payment_per_month'] / (df['annual_income'] / 12)
+    df['payment_to_income'] = df['payment_per_month'] / (df['annual_income'] / 12 + 0.001)
     
     # Risk indicators
     df['default_rate'] = df['num_defaults'] / (df['num_previous_loans'] + 1)
@@ -145,6 +170,32 @@ def preprocess_input_data(input_data: Dict[str, Any], feature_names: List[str], 
     df['loan_purpose_encoded'] = df['loan_purpose'].map(purpose_map).fillna(0)
     df['collateral_present_encoded'] = df['collateral_present'].map(collateral_map).fillna(0)
     
+    # Create dummy variables for categorical columns (if your model expects them)
+    if 'employment_status_Employed' in feature_names:
+        df['employment_status_Employed'] = (df['employment_status'] == 'Employed').astype(int)
+        df['employment_status_Self-Employed'] = (df['employment_status'] == 'Self-Employed').astype(int)
+        df['employment_status_Unemployed'] = (df['employment_status'] == 'Unemployed').astype(int)
+        df['employment_status_Retired'] = (df['employment_status'] == 'Retired').astype(int)
+        df['employment_status_Student'] = (df['employment_status'] == 'Student').astype(int)
+    
+    if 'education_level_Bachelor' in feature_names:
+        df['education_level_High School'] = (df['education_level'] == 'High School').astype(int)
+        df['education_level_Diploma'] = (df['education_level'] == 'Diploma').astype(int)
+        df['education_level_Bachelor'] = (df['education_level'] == 'Bachelor').astype(int)
+        df['education_level_Master'] = (df['education_level'] == 'Master').astype(int)
+        df['education_level_PhD'] = (df['education_level'] == 'PhD').astype(int)
+    
+    if 'loan_purpose_Business' in feature_names:
+        df['loan_purpose_Business'] = (df['loan_purpose'] == 'Business').astype(int)
+        df['loan_purpose_Crypto-Backed'] = (df['loan_purpose'] == 'Crypto-Backed').astype(int)
+        df['loan_purpose_Car Loan'] = (df['loan_purpose'] == 'Car Loan').astype(int)
+        df['loan_purpose_Education'] = (df['loan_purpose'] == 'Education').astype(int)
+        df['loan_purpose_Home Loan'] = (df['loan_purpose'] == 'Home Loan').astype(int)
+    
+    if 'collateral_present_Yes' in feature_names:
+        df['collateral_present_Yes'] = (df['collateral_present'] == 'Yes').astype(int)
+        df['collateral_present_No'] = (df['collateral_present'] == 'No').astype(int)
+    
     # Ensure all feature_names are present
     for col in feature_names:
         if col not in df.columns:
@@ -158,8 +209,11 @@ def preprocess_input_data(input_data: Dict[str, Any], feature_names: List[str], 
     
     # Scale if scaler is provided
     if scaler is not None:
-        X_scaled = scaler.transform(X)
-        X = pd.DataFrame(X_scaled, columns=feature_names)
+        try:
+            X_scaled = scaler.transform(X)
+            X = pd.DataFrame(X_scaled, columns=feature_names)
+        except Exception as e:
+            print(f"Scaling failed: {e}, using unscaled data")
     
     return X
 
@@ -175,16 +229,27 @@ def assess_risk(input_data: Dict[str, Any]) -> Dict[str, Any]:
         raise RuntimeError("Model not loaded. Please train the model first.")
     
     if not feature_names:
-        raise RuntimeError("Feature names not found. Please check model artifacts.")
+        # If feature names not available, use all numeric columns from input
+        print("Feature names not found, using default processing")
+        feature_names = list(input_data.keys())
     
     # Preprocess data
     X = preprocess_input_data(input_data, feature_names, scaler)
     
     # Make prediction
     try:
+        # Try predict_proba first
         probability = float(model.predict_proba(X)[0, 1])
+    except AttributeError:
+        # If no predict_proba, use decision_function or predict
+        try:
+            probability = float(model.decision_function(X)[0])
+            # Normalize to 0-1 if needed
+            probability = 1 / (1 + np.exp(-probability))
+        except:
+            probability = float(model.predict(X)[0])
     except Exception as e:
-        # Try alternative prediction method
+        # Final fallback
         try:
             probability = float(model.predict(X)[0])
         except:
@@ -192,6 +257,7 @@ def assess_risk(input_data: Dict[str, Any]) -> Dict[str, Any]:
     
     # Calculate risk score (0-1000, higher is safer)
     risk_score = int(round((1 - probability) * 1000))
+    risk_score = max(0, min(1000, risk_score))  # Clamp to 0-1000
     
     # Determine risk category
     if probability < 0.1:
@@ -222,8 +288,9 @@ def save_assessment(applicant_data: Dict[str, Any], assessment_result: Dict[str,
         INSERT INTO assessments
         (applicant_id, applicant_name, applicant_email, assessment_date,
          risk_score, default_probability, risk_category, data_hash,
-         annual_income, loan_amount, employment_status, credit_score)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         annual_income, loan_amount, employment_status, credit_score,
+         age, loan_term, num_previous_loans, num_defaults, payment_delay)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         applicant_data.get('applicant_id', ''),
         applicant_data.get('applicant_name', ''),
@@ -236,7 +303,12 @@ def save_assessment(applicant_data: Dict[str, Any], assessment_result: Dict[str,
         applicant_data.get('annual_income', 0),
         applicant_data.get('loan_amount', 0),
         applicant_data.get('employment_status', ''),
-        applicant_data.get('current_credit_score', 0)
+        applicant_data.get('current_credit_score', 0),
+        applicant_data.get('age', 0),
+        applicant_data.get('loan_term_months', 0),
+        applicant_data.get('num_previous_loans', 0),
+        applicant_data.get('num_defaults', 0),
+        applicant_data.get('avg_payment_delay_days', 0)
     ))
     
     conn.commit()
@@ -260,6 +332,8 @@ def load_assessment_history():
                 annual_income,
                 loan_amount,
                 credit_score,
+                age,
+                employment_status,
                 data_hash
             FROM assessments 
             ORDER BY assessment_date DESC
@@ -319,12 +393,14 @@ with st.sidebar:
     st.markdown("---")
     
     # Model status indicator
-    model, _, _, _ = load_model_artifacts()
+    model, scaler, feature_names, threshold = load_model_artifacts()
     if model is not None:
-        st.success("✓ Model loaded successfully")
+        st.success(f"✓ Model loaded successfully")
+        if feature_names:
+            st.caption(f"Features: {len(feature_names)}")
     else:
         st.error("✗ Model not loaded")
-        st.caption("Please train the model first using train.py")
+        st.caption("Please train the model first")
 
 # -------------------- New Assessment Page --------------------
 if st.session_state.page == "New Assessment":
@@ -334,7 +410,8 @@ if st.session_state.page == "New Assessment":
     # Check if model is loaded
     model, _, _, _ = load_model_artifacts()
     if model is None:
-        st.warning("Model not loaded. Please train the model first using train.py")
+        st.warning("⚠️ Model not loaded. Please check the models directory.")
+        st.info(f"Looking for model files in: {MODELS_DIR}")
         st.stop()
     
     # Create form
@@ -550,7 +627,8 @@ if st.session_state.page == "New Assessment":
         
         # Horizontal bar
         risk_score = result['risk_score']
-        ax.barh([0], [risk_score], color=colors[min(4, risk_score//200)])
+        color_idx = min(4, risk_score // 200)
+        ax.barh([0], [risk_score], color=colors[color_idx])
         ax.barh([0], [1000 - risk_score], left=[risk_score], color='#e0e0e0')
         
         ax.set_xlim(0, 1000)
@@ -620,9 +698,11 @@ elif st.session_state.page == "Assessment History":
         st.info("No assessment records found. Create a new assessment to get started.")
         
         # Button to go to new assessment
-        if st.button("Create New Assessment", type="primary"):
-            st.session_state.page = "New Assessment"
-            st.rerun()
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            if st.button("Create New Assessment", type="primary", use_container_width=True):
+                st.session_state.page = "New Assessment"
+                st.rerun()
     else:
         # Summary statistics
         st.subheader("Summary Statistics")
@@ -713,18 +793,18 @@ elif st.session_state.page == "Assessment History":
         col_act1, col_act2, col_act3, col_act4 = st.columns([1, 1, 1, 2])
         
         with col_act1:
-            if st.button("Export CSV", use_container_width=True):
-                csv = df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="Download CSV",
-                    data=csv,
-                    file_name=f"assessments_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    key="download_btn"
-                )
+            csv = df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="Export CSV",
+                data=csv,
+                file_name=f"assessments_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="download_btn"
+            )
         
         with col_act2:
-            if selected_rows and st.button("Delete Selected", use_container_width=True, type="secondary"):
+            if selected_rows and st.button("Delete Selected", use_container_width=True):
                 for idx in selected_rows:
                     row = df.iloc[idx]
                     delete_assessment(row['applicant_id'], row['assessment_date'])
@@ -732,17 +812,31 @@ elif st.session_state.page == "Assessment History":
                 st.rerun()
         
         with col_act3:
-            if st.button("Clear All History", use_container_width=True, type="secondary"):
-                confirm = st.checkbox("Confirm delete all records?")
-                if confirm:
-                    clear_all_history()
-                    st.success("All records deleted")
+            if st.button("Clear All", use_container_width=True):
+                # Use session state for confirmation
+                if 'confirm_clear' not in st.session_state:
+                    st.session_state.confirm_clear = True
                     st.rerun()
         
         with col_act4:
-            if st.button("Refresh Data", use_container_width=True):
+            if st.button("Refresh", use_container_width=True):
                 st.cache_data.clear()
                 st.rerun()
+        
+        # Confirmation dialog for clear all
+        if 'confirm_clear' in st.session_state and st.session_state.confirm_clear:
+            st.warning("Are you sure you want to delete ALL records?")
+            col_conf1, col_conf2 = st.columns(2)
+            with col_conf1:
+                if st.button("Yes, Delete All", use_container_width=True):
+                    clear_all_history()
+                    st.session_state.confirm_clear = False
+                    st.success("All records deleted")
+                    st.rerun()
+            with col_conf2:
+                if st.button("Cancel", use_container_width=True):
+                    st.session_state.confirm_clear = False
+                    st.rerun()
         
         # Detailed view for selected record
         if selected_rows and len(selected_rows) == 1:
@@ -759,12 +853,14 @@ elif st.session_state.page == "Assessment History":
                 st.text(f"Email: {record['applicant_email']}")
                 st.text(f"Assessment Date: {record['assessment_date']}")
                 st.text(f"Credit Score: {record['credit_score']}")
+                st.text(f"Age: {record['age']}")
             
             with col_det2:
                 st.text(f"Risk Score: {record['risk_score']}/1000")
-                st.text(f"Default Probability: {record['default_probability']:.1%}")
+                st.text(f"Default Probability: {record['default_probability']}")
                 st.text(f"Risk Category: {record['risk_category']}")
-                st.text(f"Loan Amount: GHS {record['loan_amount']:,.0f}")
+                st.text(f"Loan Amount: {record['loan_amount']}")
+                st.text(f"Employment: {record['employment_status']}")
             
             # Data hash
             with st.expander("Data Integrity Hash"):
@@ -777,5 +873,5 @@ elif st.session_state.page == "Assessment History":
             st.rerun()
 
 # -------------------- Footer --------------------
-# st.markdown("---")
-# st.caption("Credit Risk Assessment System")
+st.markdown("---")
+st.caption("Credit Risk Assessment System")
