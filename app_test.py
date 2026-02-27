@@ -2,10 +2,10 @@ import os
 import json
 import hashlib
 import sqlite3
+import pickle  # Use pickle instead of joblib
 from datetime import datetime
 from typing import Dict, Any, Tuple, Optional, List
 
-import joblib
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -32,10 +32,7 @@ DB_PATH = os.path.join(DATA_DIR, "assessment_results.db")
 
 # Model files
 MODEL_FILE = os.path.join(MODELS_DIR, "model.pkl")
-SCALER_FILE = os.path.join(MODELS_DIR, "scaler.pkl")
 FEATURES_FILE = os.path.join(MODELS_DIR, "features.pkl")
-CREDIT_MODEL_FILE = os.path.join(MODELS_DIR, "credit_model.pkl")
-ROBUST_SCALER_FILE = os.path.join(MODELS_DIR, "robust_scaler.pkl")
 
 # -------------------- Database Initialization --------------------
 def init_db():
@@ -74,92 +71,29 @@ def verify_data_hash(data: Dict[str, Any], original_hash: str) -> bool:
     """Verify data integrity by comparing hashes."""
     return generate_data_hash(data) == original_hash
 
-# -------------------- Simple Model Class (No XGBoost Dependency) --------------------
-class SimpleModelWrapper:
-    """
-    A simple wrapper that loads model files without requiring xgboost import.
-    """
-    def __init__(self):
-        self.model = None
-        self.scaler = None
-        self.feature_names = []
-        self.is_loaded = False
-    
-    def load(self):
-        """Load model files without triggering xgboost import."""
-        try:
-            # First try to load credit_model.pkl (might contain all artifacts)
-            if os.path.exists(CREDIT_MODEL_FILE):
-                try:
-                    data = joblib.load(CREDIT_MODEL_FILE)
-                    if isinstance(data, dict):
-                        self.model = data.get('model')
-                        self.scaler = data.get('scaler')
-                        self.feature_names = data.get('feature_names', [])
-                        if self.model is not None:
-                            self.is_loaded = True
-                            return True
-                except:
-                    pass
-            
-            # Try individual files
-            if os.path.exists(MODEL_FILE):
-                self.model = joblib.load(MODEL_FILE)
-            
-            # Try scaler (prefer robust_scaler.pkl if it exists)
-            if os.path.exists(ROBUST_SCALER_FILE):
-                self.scaler = joblib.load(ROBUST_SCALER_FILE)
-            elif os.path.exists(SCALER_FILE):
-                self.scaler = joblib.load(SCALER_FILE)
-            
-            # Load feature names
-            if os.path.exists(FEATURES_FILE):
-                self.feature_names = joblib.load(FEATURES_FILE)
-            
-            if self.model is not None:
-                self.is_loaded = True
-                return True
-            else:
-                return False
-                
-        except Exception as e:
-            st.error(f"Error loading model: {str(e)}")
-            return False
-    
-    def predict_proba(self, X):
-        """
-        Make prediction without requiring xgboost methods.
-        This handles different model types.
-        """
-        if not self.is_loaded:
-            raise RuntimeError("Model not loaded")
-        
-        # If model has predict_proba, use it
-        if hasattr(self.model, 'predict_proba'):
-            return self.model.predict_proba(X)
-        
-        # If model only has predict, convert to probability
-        elif hasattr(self.model, 'predict'):
-            pred = self.model.predict(X)
-            # Convert binary prediction to probability-like format
-            proba = np.zeros((len(pred), 2))
-            for i, p in enumerate(pred):
-                proba[i, int(p)] = 0.9
-                proba[i, 1-int(p)] = 0.1
-            return proba
-        
-        else:
-            raise RuntimeError("Model doesn't have predict_proba or predict method")
-
-# Global model instance
+# -------------------- Simple Model Loading with PICKLE --------------------
 @st.cache_resource
-def get_model():
-    """Get or create the model wrapper instance."""
-    model_wrapper = SimpleModelWrapper()
-    success = model_wrapper.load()
-    if success:
-        return model_wrapper
-    return None
+def load_model():
+    """Load model using pickle - NO XGBOOST IMPORT NEEDED"""
+    try:
+        # Just load the model file directly with pickle
+        if os.path.exists(MODEL_FILE):
+            with open(MODEL_FILE, 'rb') as f:
+                model = pickle.load(f)
+            
+            # Load features if they exist
+            feature_names = []
+            if os.path.exists(FEATURES_FILE):
+                with open(FEATURES_FILE, 'rb') as f:
+                    feature_names = pickle.load(f)
+            
+            return model, feature_names
+        else:
+            st.error(f"Model file not found: {MODEL_FILE}")
+            return None, None
+    except Exception as e:
+        st.error(f"Error loading model: {str(e)}")
+        return None, None
 
 # -------------------- Preprocessing --------------------
 EMPLOYMENT_MAPPING = {
@@ -173,10 +107,9 @@ LOAN_PURPOSE_MAPPING = {
 }
 COLLATERAL_MAPPING = {'Yes': 1, 'No': 0}
 
-def preprocess_inference_data(input_data, model_wrapper):
+def preprocess_inference_data(input_data):
     """
-    Preprocess input data for model inference.
-    Creates all features the model expects.
+    Simple preprocessing for prediction.
     """
     if isinstance(input_data, dict):
         df = pd.DataFrame([input_data])
@@ -184,102 +117,55 @@ def preprocess_inference_data(input_data, model_wrapper):
         df = input_data.copy()
 
     # Basic features
-    df['age'] = df['age'].astype(float)
-    df['annual_income'] = df['annual_income'].astype(float)
-    df['loan_amount'] = df['loan_amount'].astype(float)
-    df['credit_history_length'] = df['credit_history_length'].astype(float)
-    df['num_previous_loans'] = df['num_previous_loans'].astype(float)
-    df['num_defaults'] = df['num_defaults'].astype(float)
-    df['avg_payment_delay_days'] = df['avg_payment_delay_days'].astype(float)
-    df['current_credit_score'] = df['current_credit_score'].astype(float)
-    df['loan_term_months'] = df['loan_term_months'].astype(float)
-
-    # Categorical mappings
-    df['employment_status_encoded'] = df['employment_status'].map(EMPLOYMENT_MAPPING).fillna(0)
-    df['education_level_encoded'] = df['education_level'].map(EDUCATION_MAPPING).fillna(0)
-    df['loan_purpose_encoded'] = df['loan_purpose'].map(LOAN_PURPOSE_MAPPING).fillna(0)
-    df['collateral_present_encoded'] = df['collateral_present'].map(COLLATERAL_MAPPING).fillna(0)
-
-    # Engineered features
-    df['income_to_loan_ratio'] = df['annual_income'] / (df['loan_amount'] + 1)
-    df['payment_per_month'] = df['loan_amount'] / df['loan_term_months']
-    df['payment_to_income'] = df['payment_per_month'] / (df['annual_income'] / 12 + 0.001)
-    df['default_rate'] = df['num_defaults'] / (df['num_previous_loans'] + 1)
-    df['credit_utilization'] = (df['num_previous_loans'] * df['loan_amount']) / (df['annual_income'] + 1)
-    df['payment_reliability'] = 1 / (df['avg_payment_delay_days'] + 1)
-    df['credit_history_x_score'] = df['credit_history_length'] * df['current_credit_score']
-    df['default_x_delay'] = df['num_defaults'] * df['avg_payment_delay_days']
-    df['age_x_income'] = df['age'] * df['annual_income'] / 100000
+    feature_df = pd.DataFrame()
     
-    # Polynomial features
-    for col in ['current_credit_score', 'annual_income', 'credit_history_length', 'age']:
-        df[f'{col}_squared'] = df[col] ** 2
-        df[f'{col}_log'] = np.log1p(df[col])
+    # Add all raw features
+    feature_df['age'] = df['age'].astype(float)
+    feature_df['annual_income'] = df['annual_income'].astype(float)
+    feature_df['loan_amount'] = df['loan_amount'].astype(float)
+    feature_df['credit_history_length'] = df['credit_history_length'].astype(float)
+    feature_df['num_previous_loans'] = df['num_previous_loans'].astype(float)
+    feature_df['num_defaults'] = df['num_defaults'].astype(float)
+    feature_df['avg_payment_delay_days'] = df['avg_payment_delay_days'].astype(float)
+    feature_df['current_credit_score'] = df['current_credit_score'].astype(float)
+    feature_df['loan_term_months'] = df['loan_term_months'].astype(float)
     
-    # Dummy variables
-    employment_dummies = pd.get_dummies(df['employment_status'], prefix='employment_status')
-    education_dummies = pd.get_dummies(df['education_level'], prefix='education_level')
-    purpose_dummies = pd.get_dummies(df['loan_purpose'], prefix='loan_purpose')
-    collateral_dummies = pd.get_dummies(df['collateral_present'], prefix='collateral_present')
+    # Add encoded categoricals
+    feature_df['employment_status'] = df['employment_status'].map(EMPLOYMENT_MAPPING).fillna(0)
+    feature_df['education_level'] = df['education_level'].map(EDUCATION_MAPPING).fillna(0)
+    feature_df['loan_purpose'] = df['loan_purpose'].map(LOAN_PURPOSE_MAPPING).fillna(0)
+    feature_df['collateral_present'] = df['collateral_present'].map(COLLATERAL_MAPPING).fillna(0)
     
-    # Combine all features
-    df = pd.concat([
-        df, 
-        employment_dummies, 
-        education_dummies, 
-        purpose_dummies, 
-        collateral_dummies
-    ], axis=1)
+    # Add engineered features
+    feature_df['income_to_loan_ratio'] = df['annual_income'] / (df['loan_amount'] + 1)
+    feature_df['default_rate'] = df['num_defaults'] / (df['num_previous_loans'] + 1)
     
-    # If we have feature names from the model, use only those
-    if model_wrapper.feature_names and len(model_wrapper.feature_names) > 0:
-        for col in model_wrapper.feature_names:
-            if col not in df.columns:
-                df[col] = 0
-        X = df[model_wrapper.feature_names].copy()
-    else:
-        # Otherwise use all numeric columns
-        X = df.select_dtypes(include=[np.number]).copy()
-    
-    # Fill any missing values
-    X = X.fillna(0)
-    
-    # Apply scaler if available
-    if model_wrapper.scaler is not None:
-        try:
-            X_scaled = model_wrapper.scaler.transform(X)
-            X = pd.DataFrame(X_scaled, columns=X.columns)
-        except:
-            pass  # Use unscaled if scaling fails
-    
-    return X
+    return feature_df
 
 # -------------------- Prediction Function --------------------
 def predict_single(input_dict: dict) -> Tuple[float, int, str]:
     """
     Predict for a single applicant.
-    Returns: (probability, risk_score, category)
     """
-    model_wrapper = get_model()
+    model, feature_names = load_model()
     
-    if model_wrapper is None:
-        raise RuntimeError("Model not loaded. Please check the models directory.")
+    if model is None:
+        raise RuntimeError("Model not loaded")
     
-    # Preprocess the data
-    X = preprocess_inference_data(input_dict, model_wrapper)
+    # Preprocess
+    X = preprocess_inference_data(input_dict)
     
     # Make prediction
     try:
-        proba_array = model_wrapper.predict_proba(X)
-        # Handle different output shapes
-        if len(proba_array.shape) == 2 and proba_array.shape[1] >= 2:
-            proba = float(proba_array[0, 1])
+        # Try predict_proba first
+        if hasattr(model, 'predict_proba'):
+            proba = float(model.predict_proba(X)[0, 1])
         else:
-            proba = float(proba_array[0])
+            proba = float(model.predict(X)[0])
     except Exception as e:
         raise RuntimeError(f"Prediction failed: {str(e)}")
     
-    # Calculate risk score (higher = safer)
+    # Calculate risk score
     risk_score = int(round((1 - proba) * 1000))
     risk_score = max(0, min(1000, risk_score))
     
@@ -306,11 +192,9 @@ st.title("Credit Risk Assessment System")
 st.markdown("---")
 
 # Check model status
-model_wrapper = get_model()
-if model_wrapper is not None:
+model, feature_names = load_model()
+if model is not None:
     st.sidebar.success("✓ Model Loaded Successfully")
-    if model_wrapper.feature_names:
-        st.sidebar.info(f"Features: {len(model_wrapper.feature_names)}")
 else:
     st.sidebar.error("✗ Model Not Loaded")
     # Show available files
@@ -330,7 +214,7 @@ menu = st.sidebar.selectbox(
 if menu == "New Assessment":
     st.header("New Credit Risk Assessment")
     
-    if model_wrapper is None:
+    if model is None:
         st.error("Model not loaded. Please check the models directory.")
         st.stop()
     
@@ -467,16 +351,6 @@ if menu == "New Assessment":
                     conn.commit()
                 finally:
                     conn.close()
-
-                # Store in session state
-                st.session_state.assessment_results[applicant_id] = {
-                    "data": application,
-                    "hash": data_hash,
-                    "probability_of_default": proba,
-                    "risk_score": score,
-                    "risk_category": category,
-                    "timestamp": datetime.utcnow().isoformat()
-                }
 
                 # Display results
                 st.markdown("### Assessment Results")
